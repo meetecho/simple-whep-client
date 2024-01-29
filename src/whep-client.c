@@ -99,7 +99,7 @@ typedef struct whep_http_session {
 } whep_http_session;
 /* Helper method to send HTTP messages */
 static guint whep_http_send(whep_http_session *session, char *method,
-	char *url, char *payload, char *content_type);
+	char *url, char *payload, char *content_type, GBytes **bytes);
 
 
 /* Signal handler */
@@ -396,17 +396,18 @@ err:
 static void whep_connect(void) {
 	/* Create an HTTP connection */
 	whep_http_session session = { 0 };
-	guint status = whep_http_send(&session, "POST", (char *)server_url, "", "text/html");
+	GBytes *bytes = NULL;
+	guint status = whep_http_send(&session, "POST", (char *)server_url, "", NULL, &bytes);
 	if(status != 201) {
 		/* Didn't get the success we were expecting */
-		WHEP_LOG(LOG_ERR, " [%u] %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHEP_LOG(LOG_ERR, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
 		whep_disconnect("HTTP error");
 		return;
 	}
 	/* Get the response */
-	const char *content_type = soup_message_headers_get_content_type(session.msg->response_headers, NULL);
+	const char *content_type = soup_message_headers_get_content_type(soup_message_get_response_headers(session.msg), NULL);
 	if(content_type == NULL || strcasecmp(content_type, "application/sdp")) {
 		WHEP_LOG(LOG_ERR, "Unexpected content-type '%s'\n", content_type);
 		g_object_unref(session.msg);
@@ -414,16 +415,30 @@ static void whep_connect(void) {
 		whep_disconnect("HTTP error");
 		return;
 	}
-	const char *offer = session.msg->response_body ? session.msg->response_body->data : NULL;
-	if(offer == NULL || strstr(offer, "v=0\r\n") != offer) {
-		WHEP_LOG(LOG_ERR, "Missing or invalid SDP offer\n");
+	/* Get the body */
+	if(bytes == NULL || g_bytes_get_size(bytes) == 0) {
+		WHEP_LOG(LOG_ERR, "Missing SDP answer\n");
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
+		if(bytes != NULL)
+			g_bytes_unref(bytes);
 		whep_disconnect("SDP error");
 		return;
 	}
+	char *offer = g_malloc(g_bytes_get_size(bytes) + 1);
+	memcpy(offer, g_bytes_get_data(bytes, NULL), g_bytes_get_size(bytes));
+	offer[g_bytes_get_size(bytes)] = '\0';
+	g_bytes_unref(bytes);
+	if(strstr(offer, "v=0\r\n") != offer) {
+		WHEP_LOG(LOG_ERR, "Invalid SDP offer\n");
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+		whep_disconnect("SDP error");
+		g_free(offer);
+		return;
+	}
 	/* Check if there's an ETag we should send in upcoming requests */
-	const char *etag = soup_message_headers_get_one(session.msg->response_headers, "etag");
+	const char *etag = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "etag");
 	if(etag == NULL) {
 		WHEP_LOG(LOG_WARN, "No ETag header, won't be able to set If-Match when trickling\n");
 	} else {
@@ -431,7 +446,7 @@ static void whep_connect(void) {
 	}
 	if(follow_link) {
 		/* Check if there's Link headers with STUN/TURN servers we can use */
-		const char *link = soup_message_headers_get_list(session.msg->response_headers, "link");
+		const char *link = soup_message_headers_get_list(soup_message_get_response_headers(session.msg), "link");
 		if(link == NULL) {
 			WHEP_LOG(LOG_WARN, "No Link headers in OPTIONS response\n");
 		} else {
@@ -446,7 +461,7 @@ static void whep_connect(void) {
 		}
 	}
 	/* Parse the location header to populate the resource url */
-	const char *location = soup_message_headers_get_one(session.msg->response_headers, "location");
+	const char *location = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "location");
 	if(location == NULL) {
 		WHEP_LOG(LOG_WARN, "No Location header, won't be able to trickle or teardown the session\n");
 	} else {
@@ -455,14 +470,19 @@ static void whep_connect(void) {
 			resource_url = g_strdup(location);
 		} else {
 			/* Relative path */
-			SoupURI *uri = soup_uri_new(server_url);
-			soup_uri_set_query(uri, NULL);
+			GUri *l_uri = g_uri_parse(server_url, SOUP_HTTP_URI_FLAGS, NULL);
+			GUri *uri = NULL;
 			if(location[0] == '/') {
 				/* Use the full returned path as new path */
-				soup_uri_set_path(uri, location);
+				uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
+					g_uri_get_scheme(l_uri),
+					g_uri_get_userinfo(l_uri),
+					g_uri_get_host(l_uri),
+					g_uri_get_port(l_uri),
+					location, NULL, NULL);
 			} else {
 				/* Relative url, build the resource url accordingly */
-				const char *endpoint_path = soup_uri_get_path(uri);
+				const char *endpoint_path = g_uri_get_path(l_uri);
 				gchar **parts = g_strsplit(endpoint_path, "/", -1);
 				int i=0;
 				while(parts[i] != NULL) {
@@ -475,10 +495,17 @@ static void whep_connect(void) {
 				}
 				char *resource_path = g_strjoinv("/", parts);
 				g_strfreev(parts);
-				soup_uri_set_path(uri, resource_path);
+				uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
+					g_uri_get_scheme(l_uri),
+					g_uri_get_userinfo(l_uri),
+					g_uri_get_host(l_uri),
+					g_uri_get_port(l_uri),
+					location, NULL, NULL);
+				g_free(resource_path);
 			}
-			resource_url = soup_uri_to_string(uri, FALSE);
-			soup_uri_free(uri);
+			resource_url = g_uri_to_string(uri);
+			g_uri_unref(l_uri);
+			g_uri_unref(uri);
 		}
 		WHEP_PREFIX(LOG_INFO, "Resource URL: %s\n", resource_url);
 	}
@@ -527,11 +554,13 @@ static void whep_connect(void) {
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
 		whep_disconnect("SDP error");
+		g_free(offer);
 		return;
 	}
 	ret = gst_sdp_message_parse_buffer((guint8 *)offer, strlen(offer), sdp);
 	g_object_unref(session.msg);
 	g_object_unref(session.http_conn);
+	g_free(offer);
 	if(ret != GST_SDP_OK) {
 		/* Something went wrong */
 		gst_sdp_message_free(sdp);
@@ -645,10 +674,10 @@ static gboolean whep_send_candidates(gpointer user_data) {
 		return TRUE;
 	}
 	whep_http_session session = { 0 };
-	guint status = whep_http_send(&session, "PATCH", resource_url, fragment, "application/trickle-ice-sdpfrag");
+	guint status = whep_http_send(&session, "PATCH", resource_url, fragment, "application/trickle-ice-sdpfrag", NULL);
 	if(status != 200 && status != 204) {
 		/* Couldn't trickle? */
-		WHEP_LOG(LOG_WARN, " [trickle] %u %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHEP_LOG(LOG_WARN, " [trickle] %u %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 	}
 	g_object_unref(session.msg);
 	g_object_unref(session.http_conn);
@@ -815,18 +844,18 @@ static void whep_answer(GstWebRTCSessionDescription *answer) {
 
 	/* Create an HTTP connection */
 	whep_http_session session = { 0 };
-	guint status = whep_http_send(&session, "PATCH", (char *)resource_url, sdp_answer, "application/sdp");
+	guint status = whep_http_send(&session, "PATCH", (char *)resource_url, sdp_answer, "application/sdp", NULL);
 	g_free(sdp_answer);
 	if(status != 204) {
 		/* Didn't get the success we were expecting */
-		WHEP_LOG(LOG_ERR, " [%u] %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHEP_LOG(LOG_ERR, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
 		whep_disconnect("HTTP error");
 		return;
 	}
 	/* Check if there's an ETag we should send in upcoming requests */
-	const char *etag = soup_message_headers_get_one(session.msg->response_headers, "etag");
+	const char *etag = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "etag");
 	if(etag == NULL) {
 		WHEP_LOG(LOG_WARN, "No ETag header, won't be able to set If-Match when trickling\n");
 	} else {
@@ -850,9 +879,9 @@ static void whep_disconnect(char *reason) {
 
 	/* Create an HTTP connection */
 	whep_http_session session = { 0 };
-	guint status = whep_http_send(&session, "DELETE", resource_url, NULL, NULL);
+	guint status = whep_http_send(&session, "DELETE", resource_url, NULL, NULL, NULL);
 	if(status != 200) {
-		WHEP_LOG(LOG_WARN, " [%u] %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHEP_LOG(LOG_WARN, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 	}
 	g_object_unref(session.msg);
 	g_object_unref(session.http_conn);
@@ -861,63 +890,96 @@ static void whep_disconnect(char *reason) {
 	g_main_loop_quit(loop);
 }
 
+/* Static helper to autoaccept certificates */
+static gboolean whep_http_accept_certs(SoupMessage *msg, GTlsCertificate *certificate,
+		GTlsCertificateFlags tls_errors, gpointer user_data) {
+    return TRUE;
+}
+
 /* Helper method to send HTTP messages */
 static guint whep_http_send(whep_http_session *session, char *method,
-		char *url, char *payload, char *content_type) {
+		char *url, char *payload, char *content_type, GBytes **bytes) {
 	if(session == NULL || method == NULL || url == NULL) {
 		WHEP_LOG(LOG_ERR, "Invalid arguments...\n");
 		return 0;
 	}
 	/* Create an HTTP connection */
-	session->http_conn = soup_session_new_with_options(
-		SOUP_SESSION_SSL_STRICT, FALSE,
-		SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE, NULL
-	);
+	session->http_conn = soup_session_new();
 	session->msg = soup_message_new(method, session->redirect_url ? session->redirect_url : url);
 	soup_message_set_flags(session->msg, SOUP_MESSAGE_NO_REDIRECT);
-	if(payload != NULL && content_type != NULL)
-		soup_message_set_request(session->msg, content_type, SOUP_MEMORY_COPY, payload, strlen(payload));
+	g_signal_connect(session->msg, "accept-certificate", G_CALLBACK(whep_http_accept_certs), NULL);
+	if(payload != NULL && content_type != NULL) {
+		GBytes *pb = g_bytes_new(payload, strlen(payload));
+		soup_message_set_request_body_from_bytes(session->msg, content_type, pb);
+		g_bytes_unref(pb);
+	}
 	if(token != NULL) {
 		/* Add an authorization header too */
 		char auth[1024];
 		g_snprintf(auth, sizeof(auth), "Bearer %s", token);
-		soup_message_headers_append(session->msg->request_headers, "Authorization", auth);
+		soup_message_headers_append(soup_message_get_request_headers(session->msg), "Authorization", auth);
 	}
 	if(latest_etag != NULL) {
 		/* Add an If-Match header too with the available ETag */
-		soup_message_headers_append(session->msg->request_headers, "If-Match", latest_etag);
+		soup_message_headers_append(soup_message_get_request_headers(session->msg), "If-Match", latest_etag);
 	}
 	/* Send the message synchronously */
-	guint status = soup_session_send_message(session->http_conn, session->msg);
+	GBytes *rb = NULL;
+	GError *error = NULL;
+	if(bytes != NULL) {
+		rb = soup_session_send_and_read(session->http_conn, session->msg, NULL, &error);
+	} else {
+		GInputStream *stream = soup_session_send(session->http_conn, session->msg, NULL, &error);
+		g_object_unref(stream);
+	}
+	if(error != NULL) {
+		WHEP_LOG(LOG_ERR, "Error sending request: %s...\n", error->message);
+		g_error_free(error);
+		if(rb != NULL)
+			g_bytes_unref(rb);
+		return 0;
+	}
+	SoupStatus status = soup_message_get_status(session->msg);
 	if(status == 301 || status == 307) {
 		/* Redirected? Let's try again */
 		session->redirects++;
 		if(session->redirects > 10) {
 			/* Redirected too many times, give up... */
 			WHEP_LOG(LOG_ERR, "Too many redirects, giving up...\n");
+			if(rb != NULL)
+				g_bytes_unref(rb);
 			return 0;
 		}
 		g_free(session->redirect_url);
-		const char *location = soup_message_headers_get_one(session->msg->response_headers, "location");
+		const char *location = soup_message_headers_get_one(soup_message_get_response_headers(session->msg), "location");
 		if(strstr(location, "http")) {
 			/* Easy enough */
 			session->redirect_url = g_strdup(location);
 		} else {
 			/* Relative path */
-			SoupURI *uri = soup_uri_new(server_url);
-			soup_uri_set_query(uri, NULL);
-			soup_uri_set_path(uri, location);
-			session->redirect_url = soup_uri_to_string(uri, FALSE);
-			soup_uri_free(uri);
+			GUri *l_uri = g_uri_parse(server_url, SOUP_HTTP_URI_FLAGS, NULL);
+			GUri *uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
+				g_uri_get_scheme(l_uri),
+				g_uri_get_userinfo(l_uri),
+				g_uri_get_host(l_uri),
+				g_uri_get_port(l_uri),
+				location, NULL, NULL);
+			session->redirect_url = g_uri_to_string(uri);
+			g_uri_unref(l_uri);
+			g_uri_unref(uri);
 		}
 		WHEP_LOG(LOG_INFO, "  -- Redirected to %s\n", session->redirect_url);
 		g_object_unref(session->msg);
 		g_object_unref(session->http_conn);
-		return whep_http_send(session, method, url, payload, content_type);
+		if(rb != NULL)
+			g_bytes_unref(rb);
+		return whep_http_send(session, method, url, payload, content_type, bytes);
 	}
 	/* If we got here, we're done */
 	g_free(session->redirect_url);
 	session->redirect_url = NULL;
+	if(rb != NULL)
+		*bytes = rb;
 	return status;
 }
 
