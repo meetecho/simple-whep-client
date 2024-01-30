@@ -1,7 +1,7 @@
 Simple WHEP Client
 ==================
 
-This is a prototype implementation of a [WHEP client](https://datatracker.ietf.org/doc/html/draft-murillo-whep-00), developed by [Meetecho](https://www.meetecho.com). While it's conceived to be used mostly for testing with [Simple WHEP Server](https://github.com/meetecho/simple-whep-server) (based on [Janus](https://github.com/meetecho/janus-gateway/)), as a standard WHEP implementation in theory it should be able to interoperate just as well with other WHEP implementations. Notice, though, that just as the WHEP server, this client only implements sessions based on the server offering, meaning it will not work in case the WHEP server expects an offer from the client instead.
+This is a prototype implementation of a [WHEP client](https://datatracker.ietf.org/doc/html/draft-murillo-whep-00), developed by [Meetecho](https://www.meetecho.com). While it's conceived to be used mostly for testing with [Simple WHEP Server](https://github.com/meetecho/simple-whep-server) (based on [Janus](https://github.com/meetecho/janus-gateway/)), as a standard WHEP implementation in theory it should be able to interoperate just as well with other WHEP implementations.
 
 > Note: this is an implementation of WHEP (WebRTC-HTTP egress protocol), **NOT** WHIP (WebRTC-HTTP ingestion protocol). If you're looking for a WHIP client to ingest media in a server, check [Simple WHEP Client](https://github.com/meetecho/simple-whip-client) instead.
 
@@ -34,7 +34,9 @@ Help Options:
 Application Options:
   -u, --url                Address of the WHEP endpoint (required)
   -t, --token              Authentication Bearer token to use (optional)
-  -n, --no-trickle         Don't trickle candidates, but put them in the SDP answer (default: false)
+  -A, --audio              GStreamer caps to use for audio (optional, required if audio-only)
+  -V, --video              GStreamer caps to use for video (optional, required if video-only)
+  -n, --no-trickle         Don't trickle candidates, but put them in the SDP offer (default: false)
   -f, --follow-link        Use the Link headers returned by the WHEP server to automatically configure STUN/TURN servers to use (default: false)
   -S, --stun-server        STUN server to use, if any (stun://hostname:port)
   -T, --turn-server        TURN server to use, if any; can be called multiple times (turn(s)://username:password@host:port?transport=[udp,tcp])
@@ -48,18 +50,23 @@ Application Options:
 
 # Testing the WHEP client
 
-The WHEP client requires a single argument, that is the WHEP endpoint to subscribe to (e.g., an endpoint created in the [Simple WHEP Server](https://github.com/meetecho/simple-whep-server)). Unlike the WHIP client, you're not required to provide any pipeline for audio or video: incoming streams are automatically detected from the negotiation process, and rendered accordingly.
+The WHEP client only requires a few arguments, namely the WHEP endpoint to subscribe to (e.g., an endpoint created in the [Simple WHEP Server](https://github.com/meetecho/simple-whep-server)) and the audio and/or video caps of the codecs you expect to receive. If codecs match, incoming streams are automatically created from the negotiation process, and rendered accordingly.
 
 A simple example, that assumes the specified endpoint requires the "verysecret" token via Bearer authorization, is the following:
 
 ```
-./whep-client -u http://localhost:7090/whep/endpoint/abc123 -t verysecret
+./whep-client -u http://localhost:7090/whep/endpoint/abc123 \
+	-A "application/x-rtp,media=audio,encoding-name=opus,clock-rate=48000,encoding-params=(string)2,payload=111" \
+	-V "application/x-rtp,media=video,encoding-name=VP8,clock-rate=90000,payload=96" \
+	-t verysecret
 ```
 
 In case, e.g., STUN is needed too, the above command can be extended like this:
 
 ```
-./whep-client -u http://localhost:7080/whip/endpoint/abc123 \
+./whep-client -u http://localhost:7090/whep/endpoint/abc123 \
+	-A "application/x-rtp,media=audio,encoding-name=opus,clock-rate=48000,encoding-params=(string)2,payload=111" \
+	-V "application/x-rtp,media=video,encoding-name=VP8,clock-rate=90000,payload=96" \
 	-t verysecret -S stun://stun.l.google.com:19302
 ```
 
