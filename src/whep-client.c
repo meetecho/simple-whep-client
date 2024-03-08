@@ -40,7 +40,7 @@ enum whep_state {
 	WHEP_STATE_CONNECTION_ERROR,
 	WHEP_STATE_CONNECTED,
 	WHEP_STATE_SUBSCRIBING,
-	WHEP_STATE_ANSWER_PREPARED,
+	WHEP_STATE_OFFER_PREPARED,
 	WHEP_STATE_STARTED,
 	WHEP_STATE_API_ERROR,
 	WHEP_STATE_ERROR
@@ -49,6 +49,7 @@ enum whep_state {
 /* Global properties */
 static GMainLoop *loop = NULL;
 static GstElement *pipeline = NULL, *pc = NULL;
+static const char *audio_caps = NULL, *video_caps = NULL;
 static gboolean no_trickle = FALSE, gathering_done = FALSE,
 	follow_link = FALSE, force_turn = FALSE;
 static const char *stun_server = NULL, **turn_server = NULL;
@@ -66,9 +67,10 @@ static GAsyncQueue *candidates = NULL;
 
 /* Helper methods and callbacks */
 static gboolean whep_check_plugins(void);
+static void whep_options(void);
 static gboolean whep_initialize(void);
-static void whep_connect(void);
-static void whep_answer_available(GstPromise *promise, gpointer user_data);
+static void whep_negotiation_needed(GstElement *element, gpointer user_data);
+static void whep_offer_available(GstPromise *promise, gpointer user_data);
 static void whep_candidate(GstElement *webrtc G_GNUC_UNUSED,
 	guint mlineindex, char *candidate, gpointer user_data G_GNUC_UNUSED);
 static gboolean whep_send_candidates(gpointer user_data);
@@ -80,9 +82,9 @@ static void whep_ice_connection_state(GstElement *webrtc, GParamSpec *pspec,
 	gpointer user_data G_GNUC_UNUSED);
 static void whep_dtls_connection_state(GstElement *dtls, GParamSpec *pspec,
 	gpointer user_data G_GNUC_UNUSED);
-static void whep_answer(GstWebRTCSessionDescription *answer);
+static void whep_connect(GstWebRTCSessionDescription *offer);
 static void whep_process_link_header(char *link);
-static gboolean whep_parse_answer(char *sdp_answer);
+static gboolean whep_parse_offer(char *sdp_offer);
 static void whep_disconnect(char *reason);
 static void whep_incoming_stream(GstElement *webrtc, GstPad *pad, gpointer user_data);
 
@@ -119,7 +121,9 @@ static void whep_handle_signal(int signum) {
 static GOptionEntry opt_entries[] = {
 	{ "url", 'u', 0, G_OPTION_ARG_STRING, &server_url, "Address of the WHEP endpoint (required)", NULL },
 	{ "token", 't', 0, G_OPTION_ARG_STRING, &token, "Authentication Bearer token to use (optional)", NULL },
-	{ "no-trickle", 'n', 0, G_OPTION_ARG_NONE, &no_trickle, "Don't trickle candidates, but put them in the SDP answer (default: false)", NULL },
+	{ "audio", 'A', 0, G_OPTION_ARG_STRING, &audio_caps, "GStreamer caps to use for audio (optional, required if audio-only)", NULL },
+	{ "video", 'V', 0, G_OPTION_ARG_STRING, &video_caps, "GStreamer caps to use for video (optional, required if video-only)", NULL },
+	{ "no-trickle", 'n', 0, G_OPTION_ARG_NONE, &no_trickle, "Don't trickle candidates, but put them in the SDP offer (default: false)", NULL },
 	{ "follow-link", 'f', 0, G_OPTION_ARG_NONE, &follow_link, "Use the Link headers returned by the WHEP server to automatically configure STUN/TURN servers to use (default: false)", NULL },
 	{ "stun-server", 'S', 0, G_OPTION_ARG_STRING, &stun_server, "STUN server to use, if any (stun://hostname:port)", NULL },
 	{ "turn-server", 'T', 0, G_OPTION_ARG_STRING_ARRAY, &turn_server, "TURN server to use, if any; can be called multiple times (turn(s)://username:password@host:port?transport=[udp,tcp])", NULL },
@@ -146,7 +150,7 @@ int main(int argc, char *argv[]) {
 		exit(1);
 	}
 	/* If some arguments are missing, fail */
-	if(server_url == NULL) {
+	if(server_url == NULL || (audio_caps == NULL && video_caps == NULL)) {
 		char *help = g_option_context_get_help(opts, TRUE, NULL);
 		g_print("%s", help);
 		g_free(help);
@@ -174,7 +178,7 @@ int main(int argc, char *argv[]) {
 
 	WHEP_LOG(LOG_INFO, "WHEP endpoint:  %s\n", server_url);
 	WHEP_LOG(LOG_INFO, "Bearer Token:   %s\n", token ? token : "(none)");
-	WHEP_LOG(LOG_INFO, "Trickle ICE:    %s\n", no_trickle ? "no (candidates in SDP answer)" : "yes (HTTP PATCH)");
+	WHEP_LOG(LOG_INFO, "Trickle ICE:    %s\n", no_trickle ? "no (candidates in SDP offer)" : "yes (HTTP PATCH)");
 	WHEP_LOG(LOG_INFO, "Auto STUN/TURN: %s\n", follow_link ? "yes (via Link headers)" : "no");
 	if(!follow_link || stun_server || turn_server) {
 		if(stun_server && strstr(stun_server, "stun://") != stun_server) {
@@ -206,6 +210,8 @@ int main(int argc, char *argv[]) {
 			WHEP_LOG(LOG_INFO, "Forcing TURN:   true\n");
 		}
 	}
+	WHEP_LOG(LOG_INFO, "Audio caps: %s\n", audio_caps ? audio_caps : "(none)");
+	WHEP_LOG(LOG_INFO, "Video caps: %s\n\n", video_caps ? video_caps : "(none)");
 	if(latency > 1000)
 		WHEP_LOG(LOG_WARN, "Very high jitter-buffer latency configured (%u)\n", latency);
 
@@ -217,6 +223,9 @@ int main(int argc, char *argv[]) {
 
 	/* Start the main Glib loop */
 	loop = g_main_loop_new(NULL, FALSE);
+	/* If we need to autoconfigure STUN/TURN, send an OPTIONS */
+	if(follow_link)
+		whep_options();
 	/* Initialize the stack (and then connect to the WHEP endpoint) */
 	if(!whep_initialize())
 		exit(1);
@@ -292,6 +301,37 @@ static gboolean whep_check_plugins(void) {
 	return ret;
 }
 
+/* Helper method to send an OPTIONS to the WHEP server to get the STUN/TURN servers */
+static void whep_options(void) {
+	stun_server = NULL;
+	turn_server = NULL;
+	/* Create an HTTP connection */
+	whep_http_session session = { 0 };
+	guint status = whep_http_send(&session, "OPTIONS", (char *)server_url, NULL, NULL, NULL);
+	if(status != 200 && status != 204) {
+		/* Didn't get the success we were expecting */
+		WHEP_LOG(LOG_WARN, " [%u] %s\n\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+		return;
+	}
+	/* Check if there's Link headers with STUN/TURN servers we can use */
+	const char *link = soup_message_headers_get_list(soup_message_get_response_headers(session.msg), "link");
+	if(link == NULL) {
+		WHEP_LOG(LOG_WARN, "No Link headers in OPTIONS response\n");
+	} else {
+		WHEP_PREFIX(LOG_INFO, "Auto configuration of STUN/TURN servers:\n");
+		int i = 0;
+		gchar **links = g_strsplit(link, ", ", -1);
+		while(links[i] != NULL) {
+			whep_process_link_header(links[i]);
+			i++;
+		}
+		g_clear_pointer(&links, g_strfreev);
+	}
+	WHEP_LOG(LOG_INFO, "\n");
+}
+
 static gboolean source_events(GstPad *pad, GstObject *parent, GstEvent *event) {
 	gboolean ret;
 
@@ -321,8 +361,23 @@ static gboolean whep_initialize(void) {
 		g_object_set(pc, "turn-server", turn_server, NULL);
 	if(force_turn)
 		g_object_set(pc, "ice-transport-policy", 1, NULL);
-	gst_bin_add_many(GST_BIN(pipeline), pc, NULL);
-	gst_element_sync_state_with_parent(pipeline);
+	gst_bin_add(GST_BIN(pipeline), pc);
+	/* Add transceivers to receive audio and/or video */
+	if(audio_caps) {
+		GstWebRTCRTPTransceiver *transceiver = NULL;
+		GstCaps *caps = gst_caps_from_string(audio_caps);
+		g_signal_emit_by_name(pc, "add-transceiver", GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY, caps, &transceiver);
+		gst_caps_unref(caps);
+		gst_object_unref(transceiver);
+	}
+	if(video_caps) {
+		GstWebRTCRTPTransceiver *transceiver = NULL;
+		GstCaps *caps = gst_caps_from_string(video_caps);
+		g_signal_emit_by_name(pc, "add-transceiver", GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY, caps, &transceiver);
+		gst_caps_unref(caps);
+		gst_object_unref(transceiver);
+	}
+	gst_element_sync_state_with_parent(pc);
 	/* We'll handle incoming streams, and how to render them, dynamically */
 	g_signal_connect(pc, "pad-added", G_CALLBACK(whep_incoming_stream), pc);
 
@@ -349,6 +404,8 @@ static gboolean whep_initialize(void) {
 			i++;
 		}
 	}
+	/* Let's configure the function to be invoked when an SDP offer can be prepared */
+	g_signal_connect(pc, "on-negotiation-needed", G_CALLBACK(whep_negotiation_needed), NULL);
 	/* We need a different callback to be notified about candidates to trickle to Janus */
 	g_signal_connect(pc, "on-ice-candidate", G_CALLBACK(whep_candidate), NULL);
 	/* We also add a couple of callbacks to be notified about connection state changes */
@@ -377,9 +434,6 @@ static gboolean whep_initialize(void) {
 		goto err;
 	}
 
-	/* Now let's connect to the WHEP endpoint and wait for an answer */
-	whep_connect();
-
 	/* Done */
 	return TRUE;
 
@@ -392,214 +446,34 @@ err:
 	return FALSE;
 }
 
-/* Helper method to connect to the WHEP endpoint to subscribe */
-static void whep_connect(void) {
-	/* Create an HTTP connection */
-	whep_http_session session = { 0 };
-	GBytes *bytes = NULL;
-	guint status = whep_http_send(&session, "POST", (char *)server_url, "", NULL, &bytes);
-	if(status != 201) {
-		/* Didn't get the success we were expecting */
-		WHEP_LOG(LOG_ERR, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
-		g_object_unref(session.msg);
-		g_object_unref(session.http_conn);
-		whep_disconnect("HTTP error");
+/* Callback invoked when we need to prepare an SDP offer */
+static void whep_negotiation_needed(GstElement *element, gpointer user_data) {
+	if(resource_url != NULL) {
+		/* We've sent an offer already, is something wrong? */
+		WHEP_LOG(LOG_WARN, "GStreamer trying to create a new offer, but we don't support renegotiations yet...\n");
 		return;
 	}
-	/* Get the response */
-	const char *content_type = soup_message_headers_get_content_type(soup_message_get_response_headers(session.msg), NULL);
-	if(content_type == NULL || strcasecmp(content_type, "application/sdp")) {
-		WHEP_LOG(LOG_ERR, "Unexpected content-type '%s'\n", content_type);
-		g_object_unref(session.msg);
-		g_object_unref(session.http_conn);
-		whep_disconnect("HTTP error");
-		return;
-	}
-	/* Get the body */
-	if(bytes == NULL || g_bytes_get_size(bytes) == 0) {
-		WHEP_LOG(LOG_ERR, "Missing SDP answer\n");
-		g_object_unref(session.msg);
-		g_object_unref(session.http_conn);
-		if(bytes != NULL)
-			g_bytes_unref(bytes);
-		whep_disconnect("SDP error");
-		return;
-	}
-	char *offer = g_malloc(g_bytes_get_size(bytes) + 1);
-	memcpy(offer, g_bytes_get_data(bytes, NULL), g_bytes_get_size(bytes));
-	offer[g_bytes_get_size(bytes)] = '\0';
-	g_bytes_unref(bytes);
-	if(strstr(offer, "v=0\r\n") != offer) {
-		WHEP_LOG(LOG_ERR, "Invalid SDP offer\n");
-		g_object_unref(session.msg);
-		g_object_unref(session.http_conn);
-		whep_disconnect("SDP error");
-		g_free(offer);
-		return;
-	}
-	/* Check if there's an ETag we should send in upcoming requests */
-	const char *etag = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "etag");
-	if(etag == NULL) {
-		WHEP_LOG(LOG_WARN, "No ETag header, won't be able to set If-Match when trickling\n");
-	} else {
-		latest_etag = g_strdup(etag);
-	}
-	if(follow_link) {
-		/* Check if there's Link headers with STUN/TURN servers we can use */
-		const char *link = soup_message_headers_get_list(soup_message_get_response_headers(session.msg), "link");
-		if(link == NULL) {
-			WHEP_LOG(LOG_WARN, "No Link headers in OPTIONS response\n");
-		} else {
-			WHEP_PREFIX(LOG_INFO, "Auto configuration of STUN/TURN servers:\n");
-			int i = 0;
-			gchar **links = g_strsplit(link, ", ", -1);
-			while(links[i] != NULL) {
-				whep_process_link_header(links[i]);
-				i++;
-			}
-			g_clear_pointer(&links, g_strfreev);
-		}
-	}
-	/* Parse the location header to populate the resource url */
-	const char *location = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "location");
-	if(location == NULL) {
-		WHEP_LOG(LOG_WARN, "No Location header, won't be able to trickle or teardown the session\n");
-	} else {
-		if(strstr(location, "http")) {
-			/* Easy enough */
-			resource_url = g_strdup(location);
-		} else {
-			/* Relative path */
-			GUri *l_uri = g_uri_parse(server_url, SOUP_HTTP_URI_FLAGS, NULL);
-			GUri *uri = NULL;
-			if(location[0] == '/') {
-				/* Use the full returned path as new path */
-				uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
-					g_uri_get_scheme(l_uri),
-					g_uri_get_userinfo(l_uri),
-					g_uri_get_host(l_uri),
-					g_uri_get_port(l_uri),
-					location, NULL, NULL);
-			} else {
-				/* Relative url, build the resource url accordingly */
-				const char *endpoint_path = g_uri_get_path(l_uri);
-				gchar **parts = g_strsplit(endpoint_path, "/", -1);
-				int i=0;
-				while(parts[i] != NULL) {
-					if(parts[i+1] == NULL) {
-						/* Last part of the path, replace it */
-						g_free(parts[i]);
-						parts[i] = g_strdup(location);
-					}
-					i++;
-				}
-				char *resource_path = g_strjoinv("/", parts);
-				g_strfreev(parts);
-				uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
-					g_uri_get_scheme(l_uri),
-					g_uri_get_userinfo(l_uri),
-					g_uri_get_host(l_uri),
-					g_uri_get_port(l_uri),
-					location, NULL, NULL);
-				g_free(resource_path);
-			}
-			resource_url = g_uri_to_string(uri);
-			g_uri_unref(l_uri);
-			g_uri_unref(uri);
-		}
-		WHEP_PREFIX(LOG_INFO, "Resource URL: %s\n", resource_url);
-	}
-	if(!no_trickle) {
-		/* Now that we know the resource url, prepare the timer to send trickle candidates:
-		 * since most candidates will be local, rather than sending an HTTP PATCH message as
-		 * soon as we're aware of it, we queue it, and we send a (grouped) message every ~100ms */
-		GSource *patch_timer = g_timeout_source_new(100);
-		g_source_set_callback(patch_timer, whep_send_candidates, NULL, NULL);
-		g_source_attach(patch_timer, NULL);
-		g_source_unref(patch_timer);
-	}
-
-	/* Process the SDP offer */
-	WHEP_PREFIX(LOG_INFO, "Received SDP offer (%zu bytes)\n", strlen(offer));
-	WHEP_LOG(LOG_VERB, "%s\n", offer);
-
-	/* Check if there are any candidates in the SDP: we'll need to fake trickles in case */
-	if(strstr(offer, "candidate") != NULL) {
-		int mlines = 0, i = 0;
-		gchar **lines = g_strsplit(offer, "\r\n", -1);
-		gchar *line = NULL;
-		while(lines[i] != NULL) {
-			line = lines[i];
-			if(strstr(line, "m=") == line) {
-				/* New m-line */
-				mlines++;
-				if(mlines > 1)	/* We only need candidates from the first one */
-					break;
-			} else if(mlines == 1 && strstr(line, "a=candidate") != NULL) {
-				/* Found a candidate, fake a trickle */
-				line += 2;
-				WHEP_LOG(LOG_VERB, "  -- Found candidate: %s\n", line);
-				g_signal_emit_by_name(pc, "add-ice-candidate", 0, line);
-			}
-			i++;
-		}
-		g_clear_pointer(&lines, g_strfreev);
-	}
-	/* Convert the SDP to something webrtcbin can digest */
-	GstSDPMessage *sdp = NULL;
-	int ret = gst_sdp_message_new(&sdp);
-	if(ret != GST_SDP_OK) {
-		/* Something went wrong */
-		WHEP_LOG(LOG_ERR, "Error initializing SDP object (%d)\n", ret);
-		g_object_unref(session.msg);
-		g_object_unref(session.http_conn);
-		whep_disconnect("SDP error");
-		g_free(offer);
-		return;
-	}
-	ret = gst_sdp_message_parse_buffer((guint8 *)offer, strlen(offer), sdp);
-	g_object_unref(session.msg);
-	g_object_unref(session.http_conn);
-	g_free(offer);
-	if(ret != GST_SDP_OK) {
-		/* Something went wrong */
-		gst_sdp_message_free(sdp);
-		WHEP_LOG(LOG_ERR, "Error parsing SDP buffer (%d)\n", ret);
-		whep_disconnect("SDP error");
-		return;
-	}
-	GstWebRTCSessionDescription *gst_sdp = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_OFFER, sdp);
-
-	/* Set remote description on our pipeline */
-	WHEP_PREFIX(LOG_INFO, "Setting remote description\n");
-	GstPromise *promise = gst_promise_new();
-	g_signal_emit_by_name(pc, "set-remote-description", gst_sdp, promise);
-	gst_promise_interrupt(promise);
-	gst_promise_unref(promise);
-	gst_webrtc_session_description_free(gst_sdp);
-
-	/* Finally, create an answer to send back */
-	WHEP_PREFIX(LOG_INFO, "Creating answer\n");
-	state = WHEP_STATE_ANSWER_PREPARED;
-	promise = gst_promise_new_with_change_func(whep_answer_available, NULL, NULL);
-	g_signal_emit_by_name(pc, "create-answer", NULL, promise);
+	WHEP_PREFIX(LOG_INFO, "Creating offer\n");
+	state = WHEP_STATE_OFFER_PREPARED;
+	GstPromise *promise = gst_promise_new_with_change_func(whep_offer_available, user_data, NULL);
+	g_signal_emit_by_name(pc, "create-offer", NULL, promise);
 }
 
-/* Callback invoked when we have an SDP answer ready to be sent */
-static GstWebRTCSessionDescription *answer = NULL;
-static void whep_answer_available(GstPromise *promise, gpointer user_data) {
-	WHEP_PREFIX(LOG_INFO, "Answer created\n");
+/* Callback invoked when we have an SDP offer ready to be sent */
+static GstWebRTCSessionDescription *offer = NULL;
+static void whep_offer_available(GstPromise *promise, gpointer user_data) {
+	WHEP_PREFIX(LOG_INFO, "Offer created\n");
 	/* Make sure we're in the right state */
-	g_assert_cmphex(state, ==, WHEP_STATE_ANSWER_PREPARED);
+	g_assert_cmphex(state, ==, WHEP_STATE_OFFER_PREPARED);
 	g_assert_cmphex(gst_promise_wait(promise), ==, GST_PROMISE_RESULT_REPLIED);
 	const GstStructure *reply = gst_promise_get_reply(promise);
-	gst_structure_get(reply, "answer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &answer, NULL);
+	gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, NULL);
 	gst_promise_unref(promise);
 
 	/* Set the local description locally */
 	WHEP_PREFIX(LOG_INFO, "Setting local description\n");
 	promise = gst_promise_new();
-	g_signal_emit_by_name(pc, "set-local-description", answer, promise);
+	g_signal_emit_by_name(pc, "set-local-description", offer, promise);
 	gst_promise_interrupt(promise);
 	gst_promise_unref(promise);
 
@@ -608,13 +482,13 @@ static void whep_answer_available(GstPromise *promise, gpointer user_data) {
 	g_signal_connect(dtls, "notify::connection-state", G_CALLBACK(whep_dtls_connection_state), NULL);
 	gst_object_unref(dtls);
 
-	/* Now that the answer is ready, send it to the WHEP resource via PATCH
+	/* Now that the offer is ready, connect to the WHEP endpoint and send it there
 	 * (unless we're not tricking, in which case we wait for gathering to be
 	 * completed, and then add all candidates to this offer before sending it) */
 	if(!no_trickle || gathering_done) {
-		whep_answer(answer);
-		gst_webrtc_session_description_free(answer);
-		answer = NULL;
+		whep_connect(offer);
+		gst_webrtc_session_description_free(offer);
+		offer = NULL;
 	}
 }
 
@@ -624,7 +498,7 @@ static void whep_candidate(GstElement *webrtc G_GNUC_UNUSED,
 	if(g_atomic_int_get(&stop) || g_atomic_int_get(&disconnected))
 		return;
 	/* Make sure we're in the right state*/
-	if(state < WHEP_STATE_ANSWER_PREPARED) {
+	if(state < WHEP_STATE_OFFER_PREPARED) {
 		whep_disconnect("Can't trickle, not in a PeerConnection");
 		return;
 	}
@@ -654,7 +528,7 @@ static gboolean whep_send_candidates(gpointer user_data) {
 	g_snprintf(fragment, sizeof(fragment),
 		"a=ice-ufrag:%s\r\n"
 		"a=ice-pwd:%s\r\n"
-		"m=%s 9 RTP/AVP 0\r\n", ice_ufrag, ice_pwd, "audio");
+		"m=%s 9 RTP/AVP 0\r\n", ice_ufrag, ice_pwd, audio_caps ? "audio" : "video");
 	if(first_mid) {
 		g_strlcat(fragment, "a=mid:", sizeof(fragment));
 		g_strlcat(fragment, first_mid, sizeof(fragment));
@@ -728,9 +602,9 @@ static void whep_ice_gathering_state(GstElement *webrtc, GParamSpec *pspec,
 			gathering_done = TRUE;
 			/* If we're not trickling, send the SDP with all candidates now */
 			if(no_trickle) {
-				whep_answer(answer);
-				gst_webrtc_session_description_free(answer);
-				answer = NULL;
+				whep_connect(offer);
+				gst_webrtc_session_description_free(offer);
+				offer = NULL;
 			}
 			break;
 		default:
@@ -791,11 +665,11 @@ static void whep_dtls_connection_state(GstElement *dtls, GParamSpec *pspec,
 	}
 }
 
-/* Helper method to send our answer to the WHEP resource */
-static void whep_answer(GstWebRTCSessionDescription *answer) {
+/* Helper method to connect to the WHEP endpoint */
+static void whep_connect(GstWebRTCSessionDescription *offer) {
 	/* Convert the SDP object to a string */
-	char *sdp_answer = gst_sdp_message_as_text(answer->sdp);
-	WHEP_PREFIX(LOG_INFO, "Sending SDP answer (%zu bytes)\n", strlen(sdp_answer));
+	char *sdp_offer = gst_sdp_message_as_text(offer->sdp);
+	WHEP_PREFIX(LOG_INFO, "Sending SDP offer (%zu bytes)\n", strlen(sdp_offer));
 
 	/* If we're not trickling, add our candidates to the SDP */
 	if(no_trickle) {
@@ -813,7 +687,7 @@ static void whep_answer(GstWebRTCSessionDescription *answer) {
 		}
 		/* Add them to all m-lines */
 		int mlines = 0, i = 0;
-		gchar **lines = g_strsplit(sdp_answer, "\r\n", -1);
+		gchar **lines = g_strsplit(sdp_offer, "\r\n", -1);
 		gchar *line = NULL;
 		while(lines[i] != NULL) {
 			line = lines[i];
@@ -831,27 +705,63 @@ static void whep_answer(GstWebRTCSessionDescription *answer) {
 		}
 		g_clear_pointer(&lines, g_strfreev);
 		g_strlcat(expanded_sdp, attributes, sizeof(expanded_sdp));
-		g_free(sdp_answer);
-		sdp_answer = g_strdup(expanded_sdp);
+		g_free(sdp_offer);
+		sdp_offer = g_strdup(expanded_sdp);
 	}
-	WHEP_LOG(LOG_VERB, "%s\n", sdp_answer);
+	/* Done */
+	WHEP_LOG(LOG_VERB, "%s\n", sdp_offer);
 
 	/* Partially parse the SDP to find ICE credentials and the mid for the bundle m-line */
-	if(!whep_parse_answer(sdp_answer)) {
+	if(!whep_parse_offer(sdp_offer)) {
 		whep_disconnect("SDP error");
 		return;
 	}
 
 	/* Create an HTTP connection */
 	whep_http_session session = { 0 };
-	guint status = whep_http_send(&session, "PATCH", (char *)resource_url, sdp_answer, "application/sdp", NULL);
-	g_free(sdp_answer);
-	if(status != 204) {
+	GBytes *bytes = NULL;
+	guint status = whep_http_send(&session, "POST", (char *)server_url, sdp_offer, "application/sdp", &bytes);
+	g_free(sdp_offer);
+	if(status != 201) {
 		/* Didn't get the success we were expecting */
 		WHEP_LOG(LOG_ERR, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
+		if(bytes != NULL)
+			g_bytes_unref(bytes);
 		whep_disconnect("HTTP error");
+		return;
+	}
+	/* Get the response */
+	const char *content_type = soup_message_headers_get_content_type(soup_message_get_response_headers(session.msg), NULL);
+	if(content_type == NULL || strcasecmp(content_type, "application/sdp")) {
+		WHEP_LOG(LOG_ERR, "Unexpected content-type '%s'\n", content_type);
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+		if(bytes != NULL)
+			g_bytes_unref(bytes);
+		whep_disconnect("HTTP error");
+		return;
+	}
+	/* Get the body */
+	if(bytes == NULL || g_bytes_get_size(bytes) == 0) {
+		WHEP_LOG(LOG_ERR, "Missing SDP answer\n");
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+		if(bytes != NULL)
+			g_bytes_unref(bytes);
+		whep_disconnect("SDP error");
+		return;
+	}
+	char *answer = g_malloc(g_bytes_get_size(bytes) + 1);
+	memcpy(answer, g_bytes_get_data(bytes, NULL), g_bytes_get_size(bytes));
+	answer[g_bytes_get_size(bytes)] = '\0';
+	g_bytes_unref(bytes);
+	if(strstr(answer, "v=0\r\n") != answer) {
+		WHEP_LOG(LOG_ERR, "Invalid SDP answer\n");
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+		whep_disconnect("SDP error");
 		return;
 	}
 	/* Check if there's an ETag we should send in upcoming requests */
@@ -861,9 +771,123 @@ static void whep_answer(GstWebRTCSessionDescription *answer) {
 	} else {
 		latest_etag = g_strdup(etag);
 	}
+	/* Parse the location header to populate the resource url */
+	const char *location = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "location");
+	if(location == NULL) {
+		WHEP_LOG(LOG_WARN, "No Location header, won't be able to trickle or teardown the session\n");
+	} else {
+		if(strstr(location, "http")) {
+			/* Easy enough */
+			resource_url = g_strdup(location);
+		} else {
+			/* Relative path */
+			GUri *l_uri = g_uri_parse(server_url, SOUP_HTTP_URI_FLAGS, NULL);
+			GUri *uri = NULL;
+			if(location[0] == '/') {
+				/* Use the full returned path as new path */
+				uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
+					g_uri_get_scheme(l_uri),
+					g_uri_get_userinfo(l_uri),
+					g_uri_get_host(l_uri),
+					g_uri_get_port(l_uri),
+					location, NULL, NULL);
+			} else {
+				/* Relative url, build the resource url accordingly */
+				const char *endpoint_path = g_uri_get_path(l_uri);
+				gchar **parts = g_strsplit(endpoint_path, "/", -1);
+				int i=0;
+				while(parts[i] != NULL) {
+					if(parts[i+1] == NULL) {
+						/* Last part of the path, replace it */
+						g_free(parts[i]);
+						parts[i] = g_strdup(location);
+					}
+					i++;
+				}
+				char *resource_path = g_strjoinv("/", parts);
+				g_strfreev(parts);
+				uri = g_uri_build(SOUP_HTTP_URI_FLAGS,
+					g_uri_get_scheme(l_uri),
+					g_uri_get_userinfo(l_uri),
+					g_uri_get_host(l_uri),
+					g_uri_get_port(l_uri),
+					location, NULL, NULL);
+				g_free(resource_path);
+			}
+			resource_url = g_uri_to_string(uri);
+			g_uri_unref(l_uri);
+			g_uri_unref(uri);
+		}
+		WHEP_PREFIX(LOG_INFO, "Resource URL: %s\n", resource_url);
+	}
+	if(!no_trickle) {
+		/* Now that we know the resource url, prepare the timer to send trickle candidates:
+		 * since most candidates will be local, rather than sending an HTTP PATCH message as
+		 * soon as we're aware of it, we queue it, and we send a (grouped) message every ~100ms */
+		GSource *patch_timer = g_timeout_source_new(100);
+		g_source_set_callback(patch_timer, whep_send_candidates, NULL, NULL);
+		g_source_attach(patch_timer, NULL);
+		g_source_unref(patch_timer);
+	}
 
-	/* Negotiation done */
-	WHEP_PREFIX(LOG_INFO, "Negotiation completed\n");
+	/* Process the SDP answer */
+	WHEP_PREFIX(LOG_INFO, "Received SDP answer (%zu bytes)\n", strlen(answer));
+	WHEP_LOG(LOG_VERB, "%s\n", answer);
+
+	/* Check if there are any candidates in the SDP: we'll need to fake trickles in case */
+	if(strstr(answer, "candidate") != NULL) {
+		int mlines = 0, i = 0;
+		gchar **lines = g_strsplit(answer, "\r\n", -1);
+		gchar *line = NULL;
+		while(lines[i] != NULL) {
+			line = lines[i];
+			if(strstr(line, "m=") == line) {
+				/* New m-line */
+				mlines++;
+				if(mlines > 1)	/* We only need candidates from the first one */
+					break;
+			} else if(mlines == 1 && strstr(line, "a=candidate") != NULL) {
+				/* Found a candidate, fake a trickle */
+				line += 2;
+				WHEP_LOG(LOG_VERB, "  -- Found candidate: %s\n", line);
+				g_signal_emit_by_name(pc, "add-ice-candidate", 0, line);
+			}
+			i++;
+		}
+		g_clear_pointer(&lines, g_strfreev);
+	}
+	/* Convert the SDP to something webrtcbin can digest */
+	GstSDPMessage *sdp = NULL;
+	int ret = gst_sdp_message_new(&sdp);
+	if(ret != GST_SDP_OK) {
+		/* Something went wrong */
+		WHEP_LOG(LOG_ERR, "Error initializing SDP object (%d)\n", ret);
+		g_object_unref(session.msg);
+		g_object_unref(session.http_conn);
+		g_free(answer);
+		whep_disconnect("SDP error");
+		return;
+	}
+	ret = gst_sdp_message_parse_buffer((guint8 *)answer, strlen(answer), sdp);
+	g_object_unref(session.msg);
+	g_object_unref(session.http_conn);
+	g_free(answer);
+	if(ret != GST_SDP_OK) {
+		/* Something went wrong */
+		gst_sdp_message_free(sdp);
+		WHEP_LOG(LOG_ERR, "Error parsing SDP buffer (%d)\n", ret);
+		whep_disconnect("SDP error");
+		return;
+	}
+	GstWebRTCSessionDescription *gst_sdp = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
+
+	/* Set remote description on our pipeline */
+	WHEP_PREFIX(LOG_INFO, "Setting remote description\n");
+	GstPromise *promise = gst_promise_new();
+	g_signal_emit_by_name(pc, "set-remote-description", gst_sdp, promise);
+	gst_promise_interrupt(promise);
+	gst_promise_unref(promise);
+	gst_webrtc_session_description_free(gst_sdp);
 }
 
 /* Helper method to disconnect from the WHEP endpoint */
@@ -983,9 +1007,9 @@ static guint whep_http_send(whep_http_session *session, char *method,
 	return status;
 }
 
-/* Helper method to parse SDP answers and extract stuff we need */
-static gboolean whep_parse_answer(char *sdp_answer) {
-	gchar **parts = g_strsplit(sdp_answer, "\n", -1);
+/* Helper method to parse SDP offers and extract stuff we need */
+static gboolean whep_parse_offer(char *sdp_offer) {
+	gchar **parts = g_strsplit(sdp_offer, "\n", -1);
 	gboolean mline = FALSE, success = TRUE, done = FALSE;
 	if(parts) {
 		int index = 0;
