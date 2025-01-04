@@ -51,7 +51,7 @@ static GMainLoop *loop = NULL;
 static GstElement *pipeline = NULL, *pc = NULL;
 static const char *audio_caps = NULL, *video_caps = NULL;
 static gboolean no_trickle = FALSE, gathering_done = FALSE,
-	follow_link = FALSE, force_turn = FALSE;
+	follow_link = FALSE, force_turn = FALSE, no_decode = FALSE;
 static const char *stun_server = NULL, **turn_server = NULL;
 static char *auto_stun_server = NULL, **auto_turn_server = NULL;
 static int latency = -1;
@@ -133,6 +133,7 @@ static GOptionEntry opt_entries[] = {
 	{ "log-timestamps", 'L', 0, G_OPTION_ARG_NONE, &whep_log_timestamps, "Enable logging timestamps (default: disabled)", NULL },
 	{ "eos-sink-name", 'e', 0, G_OPTION_ARG_STRING, &eos_sink_name, "GStreamer sink name for EOS signal", NULL },
 	{ "jitter-buffer", 'b', 0, G_OPTION_ARG_INT, &latency, "Jitter buffer (latency) to use in RTP, in milliseconds (default: -1, use webrtcbin's default)", NULL },
+	{ "no-decode", 'd', 0, G_OPTION_ARG_NONE, &no_decode, "Don't decode and play received RTP streams"},
 	{ NULL },
 };
 
@@ -211,9 +212,11 @@ int main(int argc, char *argv[]) {
 		}
 	}
 	WHEP_LOG(LOG_INFO, "Audio caps: %s\n", audio_caps ? audio_caps : "(none)");
-	WHEP_LOG(LOG_INFO, "Video caps: %s\n\n", video_caps ? video_caps : "(none)");
+	WHEP_LOG(LOG_INFO, "Video caps: %s\n", video_caps ? video_caps : "(none)");
 	if(latency > 1000)
 		WHEP_LOG(LOG_WARN, "Very high jitter-buffer latency configured (%u)\n", latency);
+
+	WHEP_LOG(LOG_INFO, "Decode and play received stream: %s\n\n", no_decode ? "no" : "yes");
 
 	/* Initialize gstreamer */
 	gst_init(NULL, NULL);
@@ -1262,13 +1265,16 @@ static void whep_incoming_decodebin_stream(GstElement *decodebin, GstPad *pad, g
 	}
 }
 static void whep_incoming_stream(GstElement *webrtc, GstPad *pad, gpointer user_data) {
-	/* Create an element to decode the stream */
-	WHEP_LOG(LOG_INFO, "Creating decodebin element\n");
-	GstElement *decodebin = gst_element_factory_make("decodebin", NULL);
-	g_signal_connect(decodebin, "pad-added", G_CALLBACK(whep_incoming_decodebin_stream), pc);
-	gst_bin_add(GST_BIN(pipeline), decodebin);
-	gst_element_sync_state_with_parent(decodebin);
-	GstPad *sinkpad = gst_element_get_static_pad(decodebin, "sink");
-	gst_pad_link(pad, sinkpad);
-	gst_object_unref(sinkpad);
+	WHEP_LOG(LOG_INFO, "New incoming stream\n");
+	if (!no_decode) {
+		/* Create an element to decode the stream */
+		WHEP_LOG(LOG_INFO, "Creating decodebin element\n");
+		GstElement *decodebin = gst_element_factory_make("decodebin", NULL);
+		g_signal_connect(decodebin, "pad-added", G_CALLBACK(whep_incoming_decodebin_stream), pc);
+		gst_bin_add(GST_BIN(pipeline), decodebin);
+		gst_element_sync_state_with_parent(decodebin);
+		GstPad *sinkpad = gst_element_get_static_pad(decodebin, "sink");
+		gst_pad_link(pad, sinkpad);
+		gst_object_unref(sinkpad);
+	}
 }
