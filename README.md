@@ -1,7 +1,7 @@
 Simple WHEP Client
 ==================
 
-This is a prototype implementation of a [WHEP client](https://datatracker.ietf.org/doc/html/draft-murillo-whep-00), developed by [Meetecho](https://www.meetecho.com). While it's conceived to be used mostly for testing with [Simple WHEP Server](https://github.com/meetecho/simple-whep-server) (based on [Janus](https://github.com/meetecho/janus-gateway/)), as a standard WHEP implementation in theory it should be able to interoperate just as well with other WHEP implementations.
+This is a prototype implementation of a [WHEP client](https://datatracker.ietf.org/doc/draft-ietf-wish-whep/), developed by [Meetecho](https://www.meetecho.com). While it's conceived to be used mostly for testing with [Simple WHEP Server](https://github.com/meetecho/simple-whep-server) (based on [Janus](https://github.com/meetecho/janus-gateway/)), as a standard WHEP implementation in theory it should be able to interoperate just as well with other WHEP implementations.
 
 > Note: this is an implementation of WHEP (WebRTC-HTTP egress protocol), **NOT** WHIP (WebRTC-HTTP ingestion protocol). If you're looking for a WHIP client to ingest media in a server, check [Simple WHEP Client](https://github.com/meetecho/simple-whip-client) instead.
 
