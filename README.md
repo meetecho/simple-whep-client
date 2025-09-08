@@ -50,7 +50,7 @@ Application Options:
 
 # Testing the WHEP client
 
-The WHEP client only requires a few arguments, namely the WHEP endpoint to subscribe to (e.g., an endpoint created in the [Simple WHEP Server](https://github.com/meetecho/simple-whep-server)) and the audio and/or video caps of the codecs you expect to receive. If codecs match, incoming streams are automatically created from the negotiation process, and rendered accordingly.
+The WHEP client only requires a few arguments, namely the WHEP endpoint to subscribe to (e.g., an endpoint created in the [Simple WHEP Server](https://github.com/meetecho/simple-whep-server)) and the audio and/or video caps of the codecs you expect to receive. It will initially attempt to send an SDP offer, but if the server changes stance to reply with a server-sent offer instead (via a 406 response), it will automatically switch mode accordingly and prepare an answer to send back. If at the end of the exchange (however it happened) codecs match, incoming streams are automatically created from the negotiation process, and rendered accordingly.
 
 A simple example, that assumes the specified endpoint requires the "verysecret" token via Bearer authorization, is the following:
 
