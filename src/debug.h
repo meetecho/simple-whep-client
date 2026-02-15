@@ -68,6 +68,14 @@ static const char *whep_name_prefix[] = {
 	ANSI_COLOR_CYAN"[WHEP]"ANSI_COLOR_RESET" "
 };
 
+#if defined(_WIN32)
+static inline struct tm *
+localtime_r(const time_t *restrict t, struct tm *restrict r)
+{
+	return (localtime_s(r, t) == 0) ? r : NULL;
+}
+#endif
+
 /* Simple wrapper to g_print/printf */
 #define WHEP_PRINT g_print
 /* Logger based on different levels, which can either be displayed
